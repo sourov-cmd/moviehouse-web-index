@@ -27,6 +27,7 @@ on:
 permissions:
   id-token: write
   contents: read
+  issues: write          # the run's log tail is posted on issue #1 so it can be read without a GitHub login
 
 concurrency:
   group: catalog-sync
@@ -55,8 +56,16 @@ jobs:
         run: |
           ONLY=""
           for w in ${{ github.event.inputs.only }}; do ONLY="$ONLY --only $w"; done
+          set -o pipefail
           python sync.py --push https://moviehouse.cyou/ingest \
             --budget "${{ github.event.inputs.budget || '1500' }}" \
             --details "${{ github.event.inputs.details || '400' }}" \
             --seasons "${{ github.event.inputs.seasons || '120' }}" \
-            --rail-pages "${{ github.event.inputs.rail_pages || '3' }}" $ONLY
+            --rail-pages "${{ github.event.inputs.rail_pages || '3' }}" $ONLY 2>&1 | tee sync.log
+      - name: Post log tail
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          { echo "**${{ job.status }}** — run [${{ github.run_number }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) · ${{ github.event_name }}"; echo; echo '```'; tail -c 5000 sync.log 2>/dev/null || echo "(no output)"; echo '```'; } > body.md
+          gh issue comment 1 --repo "$GITHUB_REPOSITORY" --body-file body.md || echo "no log issue yet"
