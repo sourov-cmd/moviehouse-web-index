@@ -576,8 +576,12 @@ def main():
     plan = None
     if args.push and db is None:
         # the Worker knows what the index lacks; this runner has no copy of the database
-        plan = fetch_json(args.push + f"?plan=1&details={args.details}&seasons={args.seasons}&rankings={args.rankings}", {"Authorization": f"Bearer {args.token}"})
-        print(f"plan: wanted={len(plan.get('wanted', []))} details={len(plan.get('details', []))} seasons={len(plan.get('seasons', []))} rankings={len(plan.get('rankings', []))}")
+        try:
+            plan = fetch_json(args.push + f"?plan=1&details={args.details}&seasons={args.seasons}&rankings={args.rankings}", {"Authorization": f"Bearer {args.token}"})
+            print(f"plan: wanted={len(plan.get('wanted', []))} details={len(plan.get('details', []))} seasons={len(plan.get('seasons', []))} rankings={len(plan.get('rankings', []))}")
+        except Exception as e:  # the Worker may be over its D1 quota; the tab/rail/clip phases need no plan
+            print(f"plan: unavailable ({str(e)[:120]}) — running without it", flush=True)
+            plan = {}
     s = Sync(mb, out, adult_ids, safe_ids, args.budget, db, plan)
     only = set(args.only or [])
     t0 = time.time()
