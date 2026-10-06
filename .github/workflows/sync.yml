@@ -1,0 +1,62 @@
+name: Catalog sync
+
+# Reads MovieBox the way the MovieHouse app does and writes the catalog index into the web Worker's D1
+# through POST https://moviehouse.cyou/ingest. Auth is this job's GitHub OIDC token (audience
+# moviehouse-web-ingest, repository-bound) — no secret is stored anywhere.
+on:
+  schedule:
+    - cron: "7,37 * * * *"         # every 30 min asked for; GitHub delays/skips schedules on busy days, the Worker cron dispatches too
+  workflow_dispatch:
+    inputs:
+      budget:
+        description: MovieBox calls this run may spend
+        default: "1500"
+      only:
+        description: "Phases to run, space-separated (tabs latest rails clips rankings details seasons); empty = all"
+        default: ""
+      details:
+        description: subject details to read this run
+        default: "400"
+      seasons:
+        description: series seasons to read this run
+        default: "120"
+      rail_pages:
+        description: list pages per recipe rail
+        default: "3"
+
+permissions:
+  id-token: write
+  contents: read
+
+concurrency:
+  group: catalog-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r requirements.txt
+      - name: Mint OIDC token
+        id: oidc
+        run: |
+          TOKEN=$(curl -sS -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=moviehouse-web-ingest" | python3 -c 'import json,sys; print(json.load(sys.stdin)["value"])')
+          echo "::add-mask::$TOKEN"
+          echo "token=$TOKEN" >> "$GITHUB_OUTPUT"
+      - name: Sync
+        env:
+          INGEST_TOKEN: ${{ steps.oidc.outputs.token }}
+          MB_PROXY: ${{ secrets.MB_PROXY }}
+        run: |
+          ONLY=""
+          for w in ${{ github.event.inputs.only }}; do ONLY="$ONLY --only $w"; done
+          python sync.py --push https://moviehouse.cyou/ingest \
+            --budget "${{ github.event.inputs.budget || '1500' }}" \
+            --details "${{ github.event.inputs.details || '400' }}" \
+            --seasons "${{ github.event.inputs.seasons || '120' }}" \
+            --rail-pages "${{ github.event.inputs.rail_pages || '3' }}" $ONLY
