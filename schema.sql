@@ -32,7 +32,8 @@ CREATE TABLE IF NOT EXISTS subjects (
   codecs TEXT,                         -- "h264,hevc"
   detail_at INTEGER DEFAULT 0,         -- unix s when subject-api/get was last read (0 = card data only)
   first_seen INTEGER NOT NULL,
-  updated_at INTEGER NOT NULL
+  updated_at INTEGER NOT NULL,
+  sync_hash TEXT                       -- hash of what the sync last sent; the upsert skips unchanged rows
 );
 CREATE INDEX IF NOT EXISTS subjects_type_updated ON subjects(type, updated_at DESC);
 CREATE INDEX IF NOT EXISTS subjects_slug ON subjects(slug);
@@ -41,6 +42,7 @@ CREATE INDEX IF NOT EXISTS subjects_year ON subjects(type, year DESC);
 
 CREATE TABLE IF NOT EXISTS subject_genres (
   subject_id TEXT NOT NULL, genre TEXT NOT NULL,
+  type INTEGER NOT NULL DEFAULT 0, ok INTEGER NOT NULL DEFAULT 0, viewers INTEGER NOT NULL DEFAULT 0,  -- copied from subjects by trigger (rank index)
   PRIMARY KEY (subject_id, genre)
 );
 CREATE INDEX IF NOT EXISTS subject_genres_genre ON subject_genres(genre, subject_id);
@@ -111,3 +113,42 @@ CREATE INDEX IF NOT EXISTS subjects_browse ON subjects(adult, type, release_date
 CREATE INDEX IF NOT EXISTS subjects_country ON subjects(country);
 CREATE INDEX IF NOT EXISTS subjects_corner ON subjects(corner);
 CREATE INDEX IF NOT EXISTS subjects_resource_seen ON subjects(adult, has_resource, first_seen DESC);
+
+
+-- read-path objects (web migration 0004)
+CREATE INDEX IF NOT EXISTS subject_genres_rank ON subject_genres(genre, type, ok, viewers DESC);
+
+CREATE TRIGGER IF NOT EXISTS subject_genres_ai AFTER INSERT ON subject_genres
+BEGIN
+  UPDATE subject_genres SET type=s.type, ok=(s.adult=0 AND s.has_resource=1), viewers=s.viewers
+    FROM subjects s WHERE s.id=new.subject_id AND subject_genres.subject_id=new.subject_id AND subject_genres.genre=new.genre;
+END;
+CREATE TRIGGER IF NOT EXISTS subjects_rank_ai AFTER INSERT ON subjects
+BEGIN
+  UPDATE subject_genres SET type=new.type, ok=(new.adult=0 AND new.has_resource=1), viewers=new.viewers WHERE subject_id=new.id;
+END;
+CREATE TRIGGER IF NOT EXISTS subjects_rank_au AFTER UPDATE OF type,adult,has_resource,viewers ON subjects
+WHEN old.type IS NOT new.type OR old.adult IS NOT new.adult OR old.has_resource IS NOT new.has_resource OR old.viewers IS NOT new.viewers
+BEGIN
+  UPDATE subject_genres SET type=new.type, ok=(new.adult=0 AND new.has_resource=1), viewers=new.viewers WHERE subject_id=new.id;
+END;
+
+CREATE INDEX IF NOT EXISTS subjects_pop ON subjects(adult, type, viewers DESC);
+CREATE INDEX IF NOT EXISTS subjects_top ON subjects(adult, type, imdb DESC);
+CREATE INDEX IF NOT EXISTS subjects_country_pop ON subjects(adult, country, viewers DESC);
+CREATE INDEX IF NOT EXISTS subjects_corner_pop ON subjects(adult, corner, viewers DESC);
+CREATE INDEX IF NOT EXISTS subjects_country_new ON subjects(adult, country, release_date DESC);
+CREATE INDEX IF NOT EXISTS subjects_corner_new ON subjects(adult, corner, release_date DESC);
+
+CREATE VIRTUAL TABLE IF NOT EXISTS subjects_fts USING fts5(title, aka, content='subjects', content_rowid='rowid', tokenize='trigram');
+CREATE TRIGGER IF NOT EXISTS subjects_fts_ai AFTER INSERT ON subjects
+BEGIN INSERT INTO subjects_fts(rowid,title,aka) VALUES (new.rowid,new.title,new.aka); END;
+CREATE TRIGGER IF NOT EXISTS subjects_fts_ad AFTER DELETE ON subjects
+BEGIN INSERT INTO subjects_fts(subjects_fts,rowid,title,aka) VALUES ('delete',old.rowid,old.title,old.aka); END;
+CREATE TRIGGER IF NOT EXISTS subjects_fts_au AFTER UPDATE OF title,aka ON subjects
+WHEN old.title IS NOT new.title OR old.aka IS NOT new.aka
+BEGIN
+  INSERT INTO subjects_fts(subjects_fts,rowid,title,aka) VALUES ('delete',old.rowid,old.title,old.aka);
+  INSERT INTO subjects_fts(rowid,title,aka) VALUES (new.rowid,new.title,new.aka);
+END;
+INSERT INTO subjects_fts(subjects_fts) VALUES ('rebuild');

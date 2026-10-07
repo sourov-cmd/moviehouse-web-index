@@ -16,7 +16,7 @@ Rules ported from the app (MovieBoxCards / HomeShelves / MovieBoxMobile):
 """
 from __future__ import annotations
 
-import argparse, json, os, re, sqlite3, sys, time, unicodedata, uuid
+import argparse, hashlib, json, os, re, sqlite3, sys, time, unicodedata, uuid
 from dataclasses import dataclass, field
 
 import httpx
@@ -85,6 +85,163 @@ class Out:
         self.counts[k] = self.counts.get(k, 0) + n
 
 
+SHELF_COLS = ("id", "tab_id", "title", "slug", "kind", "stype", "pos", "category_id", "rail_json", "adult", "shorts")
+BANNER_COLS = ("tab_id", "pos", "image_url", "w", "h", "blur", "content", "subject_id", "interval_s")
+GROUP_COLS = ("shelf_id", "gpos", "title", "category_id")
+TAB_COLS = ("id", "title", "src_tab", "pos", "adult")
+
+
+def _norm(v):
+    return None if v is None else (int(v) if isinstance(v, bool) else v)
+
+
+def _row(d: dict, cols: tuple) -> tuple:
+    return tuple(_norm(d.get(c)) for c in cols)
+
+
+@dataclass
+class Layout:
+    """The tabs/banners/shelves/groups/items this run wants, kept aside and written as a diff against what the
+    index holds (Worker /ingest?plan=1&layout=…, or the local db). Before, every run deleted and re-inserted
+    every shelf of every tab: ~200k D1 rows written a day against a 100k/day limit (measured 2026-10-06)."""
+    tabs: list[tuple] | None = None                          # TAB_COLS rows, or None when the tabs phase did not run
+    banners: dict[str, list[tuple]] = field(default_factory=dict)   # tab_id -> BANNER_COLS rows (tabs this run read)
+    their: dict[str, dict[str, tuple]] = field(default_factory=dict)  # tab_id -> shelf_id -> SHELF_COLS row
+    rails: dict[str, tuple] = field(default_factory=dict)    # rail id -> SHELF_COLS row
+    groups: dict[str, list[tuple]] = field(default_factory=dict)  # shelf_id -> GROUP_COLS rows
+    items: dict[tuple[str, int], list[str]] = field(default_factory=dict)  # (shelf_id, gpos) -> subject ids by pos
+
+    def emit(self, out: Out, state: dict | None, t: int) -> dict:
+        """Statements that turn `state` into this layout. No state = the old full rewrite (nothing is ever lost)."""
+        n = {"tabs": 0, "banners": 0, "shelves": 0, "groups": 0, "items": 0, "deleted": 0}
+        st = state or {}
+        cur_tabs = [_row(r, TAB_COLS) for r in st.get("tabs") or []]
+        cur_banners: dict[str, list[tuple]] = {}
+        for r in st.get("banners") or []:
+            cur_banners.setdefault(r["tab_id"], []).append(_row(r, BANNER_COLS))
+        cur_shelves: dict[str, tuple] = {r["id"]: _row(r, SHELF_COLS) for r in st.get("shelves") or []}
+        cur_groups: dict[str, list[tuple]] = {}
+        for r in st.get("groups") or []:
+            cur_groups.setdefault(r["shelf_id"], []).append(_row(r, GROUP_COLS))
+        cur_items: dict[tuple[str, int], list[str]] = {}
+        for r in st.get("items") or []:
+            cur_items.setdefault((r["shelf_id"], int(r["gpos"])), []).append(str(r["subject_id"]))
+
+        if self.tabs is not None and (state is None or cur_tabs != self.tabs):
+            out.add("DELETE FROM tabs")
+            for row in self.tabs:
+                out.add("INSERT INTO tabs (id,title,src_tab,pos,adult) VALUES (?,?,?,?,?)", *row)
+            n["tabs"] = len(self.tabs)
+
+        for tab_id, rows in self.banners.items():
+            if state is None or cur_banners.get(tab_id, []) != rows:
+                out.add("DELETE FROM banners WHERE tab_id=?", tab_id)
+                for row in rows:
+                    out.add("INSERT INTO banners (tab_id,pos,image_url,w,h,blur,content,subject_id,interval_s) VALUES (?,?,?,?,?,?,?,?,?)", *row)
+                n["banners"] += len(rows)
+
+        def items_diff(key: tuple[str, int], want: list[str]):
+            have = cur_items.get(key, []) if state is not None else []
+            sid, gpos = key
+            for pos, s in enumerate(want):
+                if pos >= len(have) or have[pos] != s:
+                    out.add("INSERT OR REPLACE INTO shelf_items (shelf_id,gpos,pos,subject_id) VALUES (?,?,?,?)", sid, gpos, pos, s)
+                    n["items"] += 1
+            if len(have) > len(want):
+                out.add("DELETE FROM shelf_items WHERE shelf_id=? AND gpos=? AND pos>=?", sid, gpos, len(want))
+                n["deleted"] += len(have) - len(want)
+
+        def shelf_write(row: tuple):
+            if state is None or cur_shelves.get(row[0]) != row:
+                out.add("INSERT INTO shelves (id,tab_id,title,slug,kind,stype,pos,category_id,rail_json,adult,shorts,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?) "
+                        "ON CONFLICT(id) DO UPDATE SET tab_id=excluded.tab_id,title=excluded.title,slug=excluded.slug,kind=excluded.kind,stype=excluded.stype,pos=excluded.pos,"
+                        "category_id=excluded.category_id,rail_json=excluded.rail_json,adult=excluded.adult,shorts=excluded.shorts,updated_at=excluded.updated_at", *row, t)
+                n["shelves"] += 1
+            want_groups = self.groups.get(row[0], [])
+            if state is None or cur_groups.get(row[0], []) != want_groups:
+                if state is not None and cur_groups.get(row[0]):
+                    out.add("DELETE FROM shelf_groups WHERE shelf_id=?", row[0])
+                for g in want_groups:
+                    out.add("INSERT OR REPLACE INTO shelf_groups (shelf_id,gpos,title,category_id) VALUES (?,?,?,?)", *g)
+                n["groups"] += len(want_groups)
+            want_g = {k[1] for k in self.items if k[0] == row[0]}
+            for key in list(self.items):
+                if key[0] == row[0]:
+                    items_diff(key, self.items[key])
+            if state is not None:
+                for key in cur_items:
+                    if key[0] == row[0] and key[1] not in want_g:
+                        out.add("DELETE FROM shelf_items WHERE shelf_id=? AND gpos=?", key[0], key[1])
+                        n["deleted"] += len(cur_items[key])
+
+        for tab_id, shelves in self.their.items():
+            if state is not None:
+                for sid, row in cur_shelves.items():
+                    if row[1] == tab_id and row[4] == "their" and sid not in shelves:
+                        out.add("DELETE FROM shelf_items WHERE shelf_id=?", sid)
+                        out.add("DELETE FROM shelf_groups WHERE shelf_id=?", sid)
+                        out.add("DELETE FROM shelves WHERE id=?", sid)
+                        n["deleted"] += 1
+            else:
+                out.add("DELETE FROM shelf_items WHERE shelf_id IN (SELECT id FROM shelves WHERE tab_id=? AND kind='their')", tab_id)
+                out.add("DELETE FROM shelf_groups WHERE shelf_id IN (SELECT id FROM shelves WHERE tab_id=? AND kind='their')", tab_id)
+                out.add("DELETE FROM shelves WHERE tab_id=? AND kind='their'", tab_id)
+            for row in shelves.values():
+                shelf_write(row)
+        for row in self.rails.values():
+            if state is None:
+                out.add("DELETE FROM shelf_items WHERE shelf_id=?", row[0])
+            shelf_write(row)
+        return n
+
+
+def layout_state_from_db(db: sqlite3.Connection, all_kinds: bool) -> dict:
+    """The same picture /ingest?plan=1&layout=… gives, from a local SQLite copy."""
+    def q(sql, cols):
+        return [dict(zip(cols, r)) for r in db.execute(sql).fetchall()]
+    kind = "" if all_kinds else " WHERE kind='their'"
+    skind = "" if all_kinds else " WHERE s.kind='their'"
+    return {
+        "tabs": q("SELECT id,title,src_tab,pos,adult FROM tabs ORDER BY pos", TAB_COLS),
+        "banners": q("SELECT tab_id,pos,image_url,w,h,blur,content,subject_id,interval_s FROM banners ORDER BY tab_id,pos", BANNER_COLS),
+        "shelves": q(f"SELECT id,tab_id,title,slug,kind,stype,pos,category_id,rail_json,adult,shorts FROM shelves{kind} ORDER BY tab_id,pos", SHELF_COLS),
+        "groups": q(f"SELECT g.shelf_id,g.gpos,g.title,g.category_id FROM shelf_groups g JOIN shelves s ON s.id=g.shelf_id{skind} ORDER BY g.shelf_id,g.gpos", GROUP_COLS),
+        "items": q(f"SELECT i.shelf_id,i.gpos,i.pos,i.subject_id FROM shelf_items i JOIN shelves s ON s.id=i.shelf_id{skind} ORDER BY i.shelf_id,i.gpos,i.pos", ("shelf_id", "gpos", "pos", "subject_id")),
+    }
+
+
+def merge_subject(old: tuple, new: tuple) -> tuple:
+    """Two sightings of one title in a run, folded the way the SQL upsert folds a new sighting into the stored row."""
+    o, n = list(old), list(new)
+    last = {0, 1, 2, 3, 13, 14, 17, 18, 20, 23, 24}                       # id,type,title,slug,cover_w/h,still_w/h,restrict_kid,has_resource,is_cam
+    nonempty = {4, 8, 9, 10, 12, 15, 16, 21, 22, 26, 27}                  # description,genre,country,language,cover_url,cover_blur,still_url,corner,detail_url,subtitles,aka
+    coalesce = {5, 6, 11, 19, 31, 32}                                     # release_date,year,imdb,content_rating,resolutions,codecs
+    mx = {25, 28, 29, 30}                                                 # se_num,viewers,adult,mature
+    out = []
+    for i in range(len(n)):
+        if i in last:
+            out.append(n[i])
+        elif i in nonempty:
+            out.append(n[i] if (n[i] or "") != "" else o[i])
+        elif i in coalesce:
+            out.append(n[i] if n[i] is not None else o[i])
+        elif i in mx:
+            out.append(max(n[i] or 0, o[i] or 0))
+        elif i == 7:                                                      # duration_s: a known runtime wins
+            out.append(n[i] if (n[i] or 0) > 0 else o[i])
+        else:
+            out.append(n[i])
+    return tuple(out)
+
+
+def quantize(v: int) -> int:
+    """Viewer counts drift every run; two significant digits keep the row's hash still until the count really moves."""
+    v = int(v or 0)
+    if v < 100:
+        return v
+    return int(float(f"{v:.2g}"))
+
+
 class Sync:
     def __init__(self, mb: MB, out: Out, adult_ids: set[str], safe_ids: set[str], budget: int, db: sqlite3.Connection | None, plan: dict | None = None):
         # what the Worker says needs reading when there is no local db (GitHub Actions runs): {wanted, details, seasons}
@@ -96,6 +253,8 @@ class Sync:
         self.seen_subjects: set[str] = set()
         self.fresh_series: list[str] = []   # series upserted with detail this run (seasons follow)
         self.adult_subjects: set[str] = set()
+        self.layout = Layout()
+        self.pending: dict[str, dict] = {}   # sid -> merged values waiting for flush_subjects()
 
     # ---- budget
     def spend(self, n=1) -> bool:
@@ -155,11 +314,55 @@ class Sync:
                         cods.add(str(r["codecName"]).lower())
             res = ",".join(str(h) for h in sorted(heights)) if heights else ""
             codecs = ",".join(sorted(cods))
+        values = (
+            sid, int(s.get("subjectType") or 0), title, slugify(ct), (s.get("description") or "").strip(), rd, year_of(rd), int(dur or 0),
+            (s.get("genre") or "").strip(), country_of(s.get("countryName")), (s.get("language") or "").strip(), imdb,
+            cover.get("url") or "", cover.get("width") or 0, cover.get("height") or 0, cover.get("thumbnail") or "",
+            still.get("url") or "", still.get("width") or 0, still.get("height") or 0, cert, restrict, (s.get("corner") or "").strip(),
+            (s.get("detailUrl") or "").strip(), 0 if s.get("hasResource") is False else 1, 1 if s.get("isCam") else 0,
+            int(s.get("seNum") or s.get("season") or 0), (s.get("subtitles") or "").strip(), (s.get("aka") or "").strip(),
+            int(s.get("viewers") or 0), 1 if adult else 0, mature, res, codecs,
+        )
+        # A title met on several shelves in one run is merged here (the same rules as the SQL below) and written once,
+        # so its hash is the same from run to run; written per sighting, two sightings with different card data
+        # would rewrite the row twice every run (measured locally: 10% of the titles).
+        prev = self.pending.get(sid)
+        if prev:
+            values = merge_subject(prev["values"], values)
+            detail = detail or prev["detail"]
+        self.pending[sid] = {"values": values, "detail": detail, "t": t}
+        for g in genres_of(s.get("genre")):
+            self.out.add("INSERT OR IGNORE INTO subject_genres (subject_id, genre) VALUES (?,?)", sid, g)
+        if detail:
+            if int(s.get("subjectType") or 0) == 2:
+                self.fresh_series.append(sid)
+            self.out.add("DELETE FROM subject_staff WHERE subject_id=?", sid)
+            for i, st in enumerate(s.get("staffList") or []):
+                stid, name = str(st.get("staffId") or ""), (st.get("name") or "").strip()
+                if not stid or not name:
+                    continue
+                self.out.add(
+                    "INSERT INTO staff (id,name,slug,avatar,updated_at) VALUES (?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET name=excluded.name, slug=excluded.slug, avatar=COALESCE(NULLIF(excluded.avatar,''), staff.avatar), updated_at=excluded.updated_at",
+                    stid, name, slugify(name), st.get("avatarUrl") or "", t)
+                self.out.add("INSERT OR REPLACE INTO subject_staff (subject_id,staff_id,staff_type,character,pos) VALUES (?,?,?,?,?)",
+                             sid, stid, int(st.get("staffType") or 0), (st.get("character") or "").strip() or None, i)
+
+    def flush_subjects(self):
+        """One upsert per title seen since the last flush. The hash of what is sent (viewers quantised) goes with it;
+        the upsert's WHERE skips the write when the row was last written from the same data (measured 2026-10-07)."""
+        for sid, p in self.pending.items():
+            values, detail, t = p["values"], p["detail"], p["t"]
+            sync_hash = hashlib.md5(json.dumps(values[:28] + (quantize(values[28]),) + values[29:], ensure_ascii=False).encode()).hexdigest()[:16]
+            self._emit_subject(values, detail, t, sync_hash)
+        self.out.bump("subjects", len(self.pending))
+        self.pending = {}
+
+    def _emit_subject(self, values: tuple, detail: bool, t: int, sync_hash: str):
         self.out.add(
             """INSERT INTO subjects (id,type,title,slug,description,release_date,year,duration_s,genre,country,language,imdb,
                  cover_url,cover_w,cover_h,cover_blur,still_url,still_w,still_h,content_rating,restrict_kid,corner,detail_url,
-                 has_resource,is_cam,se_num,subtitles,aka,viewers,adult,mature,resolutions,codecs,detail_at,first_seen,updated_at)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                 has_resource,is_cam,se_num,subtitles,aka,viewers,adult,mature,resolutions,codecs,detail_at,first_seen,updated_at,sync_hash)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                ON CONFLICT(id) DO UPDATE SET
                  type=excluded.type, title=excluded.title, slug=excluded.slug,
                  description=CASE WHEN length(excluded.description)>0 THEN excluded.description ELSE subjects.description END,
@@ -178,46 +381,21 @@ class Sync:
                  viewers=MAX(excluded.viewers, subjects.viewers),
                  adult=MAX(excluded.adult, subjects.adult), mature=MAX(excluded.mature, subjects.mature),
                  resolutions=COALESCE(excluded.resolutions, subjects.resolutions), codecs=COALESCE(excluded.codecs, subjects.codecs),
-                 detail_at=MAX(excluded.detail_at, subjects.detail_at), updated_at=excluded.updated_at""",
-            sid, int(s.get("subjectType") or 0), title, slugify(ct), (s.get("description") or "").strip(), rd, year_of(rd), int(dur or 0),
-            (s.get("genre") or "").strip(), country_of(s.get("countryName")), (s.get("language") or "").strip(), imdb,
-            cover.get("url") or "", cover.get("width") or 0, cover.get("height") or 0, cover.get("thumbnail") or "",
-            still.get("url") or "", still.get("width") or 0, still.get("height") or 0, cert, restrict, (s.get("corner") or "").strip(),
-            (s.get("detailUrl") or "").strip(), 0 if s.get("hasResource") is False else 1, 1 if s.get("isCam") else 0,
-            int(s.get("seNum") or s.get("season") or 0), (s.get("subtitles") or "").strip(), (s.get("aka") or "").strip(),
-            int(s.get("viewers") or 0), 1 if adult else 0, mature, res, codecs, t if detail else 0, t, t,
+                 detail_at=MAX(excluded.detail_at, subjects.detail_at), updated_at=excluded.updated_at, sync_hash=excluded.sync_hash
+               WHERE subjects.sync_hash IS NOT excluded.sync_hash""",
+            *values, t if detail else 0, t, t, sync_hash,
         )
-        for g in genres_of(s.get("genre")):
-            self.out.add("INSERT OR IGNORE INTO subject_genres (subject_id, genre) VALUES (?,?)", sid, g)
-        if detail:
-            if int(s.get("subjectType") or 0) == 2:
-                self.fresh_series.append(sid)
-            self.out.add("DELETE FROM subject_staff WHERE subject_id=?", sid)
-            for i, st in enumerate(s.get("staffList") or []):
-                stid, name = str(st.get("staffId") or ""), (st.get("name") or "").strip()
-                if not stid or not name:
-                    continue
-                self.out.add(
-                    "INSERT INTO staff (id,name,slug,avatar,updated_at) VALUES (?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET name=excluded.name, slug=excluded.slug, avatar=COALESCE(NULLIF(excluded.avatar,''), staff.avatar), updated_at=excluded.updated_at",
-                    stid, name, slugify(name), st.get("avatarUrl") or "", t)
-                self.out.add("INSERT OR REPLACE INTO subject_staff (subject_id,staff_id,staff_type,character,pos) VALUES (?,?,?,?,?)",
-                             sid, stid, int(st.get("staffType") or 0), (st.get("character") or "").strip(), i)
-        self.seen_subjects.add(sid)
-        self.out.bump("subjects")
 
-    # ---- layout
     def sync_tabs(self, recipe: dict):
         t = now()
-        self.out.add("DELETE FROM tabs")
         tabs = list(recipe.get("tabs") or [])
-        for i, tab in enumerate(tabs):
-            self.out.add("INSERT INTO tabs (id,title,src_tab,pos,adult) VALUES (?,?,?,?,?)",
-                         tab["id"], tab.get("title") or tab["id"], int(tab.get("srcTab") or 0), i, 1 if tab.get("adult") else 0)
+        rows = [(tab["id"], tab.get("title") or tab["id"], int(tab.get("srcTab") or 0), i, 1 if tab.get("adult") else 0) for i, tab in enumerate(tabs)]
         # Music is the app's own section (bottom bar), fed by their music channel's tab: pos 90+ keeps it out of the strip
         music_src = int((recipe.get("music") or {}).get("srcTab") or 0)
         if music_src > 0:
-            self.out.add("INSERT INTO tabs (id,title,src_tab,pos,adult) VALUES (?,?,?,?,?)", "music", "Music", music_src, 90, 0)
+            rows.append(("music", "Music", music_src, 90, 0))
             tabs.append({"id": "music", "title": "Music", "srcTab": music_src})
+        self.layout.tabs = rows
         for tab in tabs:
             src = int(tab.get("srcTab") or 0)
             if src <= 0 or not self.spend():
@@ -233,7 +411,7 @@ class Sync:
         adult_tab = bool(tab.get("adult"))
         items = (j.get("data") or {}).get("items") or []
         # banners
-        self.out.add("DELETE FROM banners WHERE tab_id=?", tab_id)
+        banner_rows: list[tuple] = []
         pos = 0
         for o in items:
             b = o.get("banner") or {}
@@ -244,16 +422,14 @@ class Sync:
                 sub = it.get("subject")
                 if sub:
                     self.upsert_subject(sub, adult_tab)
-                self.out.add("INSERT INTO banners (tab_id,pos,image_url,w,h,blur,content,subject_id,interval_s) VALUES (?,?,?,?,?,?,?,?,?)",
-                             tab_id, pos, img["url"], img.get("width") or 0, img.get("height") or 0, img.get("thumbnail") or "",
-                             (it.get("content") or (sub or {}).get("title") or "").strip(), str((sub or {}).get("subjectId") or it.get("subjectId") or "") or None,
-                             int(str(b.get("interval") or "4") or 4))
+                banner_rows.append((tab_id, pos, img["url"], img.get("width") or 0, img.get("height") or 0, img.get("thumbnail") or "",
+                                    (it.get("content") or (sub or {}).get("title") or "").strip(), str((sub or {}).get("subjectId") or it.get("subjectId") or "") or None,
+                                    int(str(b.get("interval") or "4") or 4)))
                 pos += 1
+        self.layout.banners[tab_id] = banner_rows
         self.out.bump("banners", pos)
-        # their shelves, in their order
-        self.out.add("DELETE FROM shelf_items WHERE shelf_id IN (SELECT id FROM shelves WHERE tab_id=? AND kind='their')", tab_id)
-        self.out.add("DELETE FROM shelf_groups WHERE shelf_id IN (SELECT id FROM shelves WHERE tab_id=? AND kind='their')", tab_id)
-        self.out.add("DELETE FROM shelves WHERE tab_id=? AND kind='their'", tab_id)
+        # their shelves, in their order (written as a diff against the index, see Layout)
+        shelves = self.layout.their.setdefault(tab_id, {})
         spos = 0
         for o in items:
             title = (o.get("title") or "").strip()
@@ -301,12 +477,11 @@ class Sync:
             if drop:
                 continue
             adult_shelf = adult_tab or any(g.lower() in ADULT_GENRES for g in [title])
-            self.out.add("INSERT INTO shelves (id,tab_id,title,slug,kind,stype,pos,category_id,rail_json,adult,shorts,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
-                         shelf_id, tab_id, strip_glyphs(title), slugify(strip_glyphs(title)) + ("" if tab_id == "home" else f"-{tab_id}"), "their", stype, spos, cat or None, None,
-                         1 if adult_shelf else 0, shorts, t)
+            shelves[shelf_id] = (shelf_id, tab_id, strip_glyphs(title), slugify(strip_glyphs(title)) + ("" if tab_id == "home" else f"-{tab_id}"), "their", stype, spos, cat or None, None,
+                                 1 if adult_shelf else 0, shorts)
             if groups:
+                self.layout.groups[shelf_id] = [(shelf_id, gi, name, gcat or None) for gi, (name, gcat, rows) in enumerate(groups)]
                 for gi, (name, gcat, rows) in enumerate(groups):
-                    self.out.add("INSERT INTO shelf_groups (shelf_id,gpos,title,category_id) VALUES (?,?,?,?)", shelf_id, gi, name, gcat or None)
                     self.add_items(shelf_id, gi, rows, adult_shelf)
             else:
                 self.add_items(shelf_id, 0, subjects, adult_shelf)
@@ -322,7 +497,10 @@ class Sync:
                 continue
             seen.add(sid)
             self.upsert_subject(s, adult)
-            self.out.add("INSERT OR REPLACE INTO shelf_items (shelf_id,gpos,pos,subject_id) VALUES (?,?,?,?)", shelf_id, gpos, pos, sid)
+            lst = self.layout.items.setdefault((shelf_id, gpos), [])
+            if start == 0 and pos == 0:
+                lst.clear()
+            lst.append(sid)
             pos += 1
         return pos
 
@@ -333,24 +511,31 @@ class Sync:
         for i, r in enumerate(rails):
             rid = r["id"]
             adult = bool(r.get("adult"))
-            self.out.add("INSERT INTO shelves (id,tab_id,title,slug,kind,stype,pos,category_id,rail_json,adult,shorts,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET tab_id=excluded.tab_id,title=excluded.title,slug=excluded.slug,pos=excluded.pos,rail_json=excluded.rail_json,adult=excluded.adult,updated_at=excluded.updated_at",
-                         rid, r["tab"], r.get("title") or rid, slugify(f"{r.get('title') or rid}") + ("" if r["tab"] == "home" else f"-{r['tab']}"), "rail", "rail", 1000 + i, None,
-                         json.dumps({k: r[k] for k in ("subjectType", "genre", "country", "classify", "sort", "year") if r.get(k)}), 1 if adult else 0,
-                         1 if r.get("subjectType") == SHORT_DRAMA else 0, t)
+            if self.calls >= self.budget:
+                return
+            row = (rid, r["tab"], r.get("title") or rid, slugify(f"{r.get('title') or rid}") + ("" if r["tab"] == "home" else f"-{r['tab']}"), "rail", "rail", 1000 + i, None,
+                   json.dumps({k: r[k] for k in ("subjectType", "genre", "country", "classify", "sort", "year") if r.get(k)}), 1 if adult else 0,
+                   1 if r.get("subjectType") == SHORT_DRAMA else 0)
             pos = 0
+            got = False
             for page in range(1, pages + 1):
                 if not self.spend():
-                    return
+                    break
                 j = self.mb.list(int(r["subjectType"]), page=page, genre=r.get("genre", ""), country=r.get("country", ""),
                                  classify=r.get("classify", ""), sort=r.get("sort", ""), year=str(r.get("year", "") or ""))
                 data = (j or {}).get("data") or {}
                 items = data.get("items") or []
                 if page == 1:
-                    self.out.add("DELETE FROM shelf_items WHERE shelf_id=?", rid)
+                    if not j:
+                        break   # no answer for this rail: keep what the index has
+                    self.layout.items[(rid, 0)] = []
+                    got = True
                 pos = self.add_items(rid, 0, items, adult, start=pos)
                 if not (data.get("pager") or {}).get("hasMore"):
                     break
-            self.out.bump("rails")
+            if got:
+                self.layout.rails[rid] = row
+                self.out.bump("rails")
 
     def sync_clips(self, recipe: dict, pages: int):
         """The Clips section: MovieBox's short dramas (recipe clips.subjectType), the viewer's countries first like the app."""
@@ -555,7 +740,18 @@ def main():
     ap.add_argument("--clip-pages", type=int, default=5)
     ap.add_argument("--only", choices=["tabs", "rails", "details", "seasons", "latest", "rankings", "clips"], action="append")
     ap.add_argument("--proxy", action="store_true")
+    ap.add_argument("--auto", action="store_true", help="pick the phases by the clock: the wide walk (rails clips rankings) at 02/08/14/20 UTC, tabs latest details seasons otherwise")
     args = ap.parse_args()
+    if args.auto and not args.only:
+        # the same split the Worker's cron uses (sync-trigger.ts); GitHub's schedule cannot pass inputs
+        now_utc = time.gmtime()
+        if now_utc.tm_hour in (2, 8, 14, 20) and now_utc.tm_min < 30:
+            args.only = ["rails", "clips", "rankings"]
+            args.budget = min(args.budget, 1500)
+        else:
+            args.only = ["tabs", "latest", "details", "seasons"]
+            args.budget, args.details, args.seasons = min(args.budget, 400), min(args.details, 150), min(args.seasons, 60)
+        print(f"auto: {' '.join(args.only)} budget={args.budget}")
 
     recipe = fetch_json(GATEWAY + "/v1/mb-recipe", {"User-Agent": APP_UA})
     adult_doc = fetch_json(GATEWAY + "/v1/mb-adult", {"User-Agent": APP_UA, "X-App-Version": "63"})
@@ -574,16 +770,19 @@ def main():
         raise SystemExit(f"visitor-login failed: {mb.last}")
     out = Out()
     plan = None
+    only = set(args.only or [])
+    wide = not only or "rails" in only
     if args.push and db is None:
         # the Worker knows what the index lacks; this runner has no copy of the database
         try:
-            plan = fetch_json(args.push + f"?plan=1&details={args.details}&seasons={args.seasons}&rankings={args.rankings}", {"Authorization": f"Bearer {args.token}"})
-            print(f"plan: wanted={len(plan.get('wanted', []))} details={len(plan.get('details', []))} seasons={len(plan.get('seasons', []))} rankings={len(plan.get('rankings', []))}")
+            plan = fetch_json(args.push + f"?plan=1&details={args.details}&seasons={args.seasons}&rankings={args.rankings}&layout={'all' if wide else 'their'}", {"Authorization": f"Bearer {args.token}"})
+            st = plan.get("state") or {}
+            print(f"plan: wanted={len(plan.get('wanted', []))} details={len(plan.get('details', []))} seasons={len(plan.get('seasons', []))} rankings={len(plan.get('rankings', []))} "
+                  f"layout: shelves={len(st.get('shelves', []))} items={len(st.get('items', []))}")
         except Exception as e:  # the Worker may be over its D1 quota; the tab/rail/clip phases need no plan
             print(f"plan: unavailable ({str(e)[:120]}) — running without it", flush=True)
             plan = {}
     s = Sync(mb, out, adult_ids, safe_ids, args.budget, db, plan)
-    only = set(args.only or [])
     t0 = time.time()
     if not only or "tabs" in only:
         s.sync_tabs(recipe)
@@ -593,17 +792,23 @@ def main():
         s.sync_rails(recipe, args.rail_pages)
     if not only or "clips" in only:
         s.sync_clips(recipe, args.clip_pages)
+    s.flush_subjects()
+    # the layout (tabs, banners, shelves, items) goes out as a diff against what the index holds
+    state = plan.get("state") if plan else (layout_state_from_db(db, wide) if db is not None else None)
+    print(f"layout diff: {s.layout.emit(out, state, now())}" + ("" if state is not None else " (no state: full rewrite)"))
     # subjects seen above must exist before detail/season queries read the db
     if db is not None:
         apply_sqlite(db, out)
     if not only or "rankings" in only:
         s.sync_rankings(args.rankings)
+    s.flush_subjects()
     if db is not None:
         apply_sqlite(db, out)
     if not only or "details" in only:
         s.sync_details(args.details)
     if not only or "seasons" in only:
         s.sync_seasons(args.seasons)
+    s.flush_subjects()
     out.add("INSERT OR REPLACE INTO meta (key,value) VALUES ('last_sync', ?)", str(now()))
     out.add("INSERT OR REPLACE INTO meta (key,value) VALUES ('recipe_version', ?)", str(recipe.get("version")))
     if db is not None:
@@ -615,3 +820,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

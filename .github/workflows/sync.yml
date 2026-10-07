@@ -57,7 +57,9 @@ jobs:
           ONLY=""
           for w in ${{ github.event.inputs.only }}; do ONLY="$ONLY --only $w"; done
           set -o pipefail
+          # a scheduled run picks its phases by the clock (--auto): the wide walk four times a day, the light one otherwise
           python sync.py --push https://moviehouse.cyou/ingest \
+            $([ "${{ github.event_name }}" = "schedule" ] && echo --auto) \
             --budget "${{ github.event.inputs.budget || '1500' }}" \
             --details "${{ github.event.inputs.details || '400' }}" \
             --seasons "${{ github.event.inputs.seasons || '120' }}" \
@@ -69,3 +71,4 @@ jobs:
         run: |
           { echo "**${{ job.status }}** — run [${{ github.run_number }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) · ${{ github.event_name }}"; echo; echo '```'; tail -c 5000 sync.log 2>/dev/null || echo "(no output)"; echo '```'; } > body.md
           gh issue comment 1 --repo "$GITHUB_REPOSITORY" --body-file body.md || echo "no log issue yet"
+
