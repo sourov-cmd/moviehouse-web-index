@@ -33,7 +33,9 @@ CREATE TABLE IF NOT EXISTS subjects (
   detail_at INTEGER DEFAULT 0,         -- unix s when subject-api/get was last read (0 = card data only)
   first_seen INTEGER NOT NULL,
   updated_at INTEGER NOT NULL,
-  sync_hash TEXT                       -- hash of what the sync last sent; the upsert skips unchanged rows
+  sync_hash TEXT,                      -- hash of what the sync last sent; the upsert skips unchanged rows
+  source TEXT NOT NULL DEFAULT 'mb',   -- 'mb' (MovieBox) or 'rtally' (rtally_sync.py); web migration 0005
+  src_id TEXT                          -- the source's own id for the row
 );
 CREATE INDEX IF NOT EXISTS subjects_type_updated ON subjects(type, updated_at DESC);
 CREATE INDEX IF NOT EXISTS subjects_slug ON subjects(slug);
@@ -152,3 +154,7 @@ BEGIN
   INSERT INTO subjects_fts(rowid,title,aka) VALUES (new.rowid,new.title,new.aka);
 END;
 INSERT INTO subjects_fts(subjects_fts) VALUES ('rebuild');
+
+-- second source (web migration 0005)
+CREATE TABLE IF NOT EXISTS plays (subject_id TEXT NOT NULL, se INTEGER NOT NULL DEFAULT 0, source TEXT NOT NULL, play_json TEXT NOT NULL, updated_at INTEGER NOT NULL, PRIMARY KEY (subject_id, se));
+CREATE TABLE IF NOT EXISTS aliases (id TEXT PRIMARY KEY, target TEXT NOT NULL, created_at INTEGER NOT NULL);
