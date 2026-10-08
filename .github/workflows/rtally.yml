@@ -1,0 +1,44 @@
+name: rtally sync
+
+# Second content source (rtally_sync.py): titles MovieBox does not have, written into the same index through
+# POST https://moviehouse.cyou/ingest with this job's OIDC token. Runs a few times a day; each run adds at most
+# --max-new new titles (D1 free plan: 100k rows written a day, shared with the MovieBox sync).
+on:
+  schedule:
+    - cron: "23 1,7,13,19 * * *"
+  workflow_dispatch:
+    inputs:
+      max_new:
+        description: new titles this run may add
+        default: "400"
+
+permissions:
+  id-token: write
+  contents: read
+  issues: write
+
+concurrency:
+  group: catalog-sync
+  cancel-in-progress: false
+
+jobs:
+  rtally:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r requirements.txt
+      - name: Sync
+        run: |
+          set -o pipefail
+          python rtally_sync.py --push https://moviehouse.cyou/ingest --max-new "${{ github.event.inputs.max_new || '400' }}" 2>&1 | tee sync.log
+      - name: Post log tail
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          { echo "**${{ job.status }}** — rtally run [${{ github.run_number }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) · ${{ github.event_name }}"; echo; echo '```'; tail -c 4000 sync.log 2>/dev/null || echo "(no output)"; echo '```'; } > body.md
+          gh issue comment 1 --repo "$GITHUB_REPOSITORY" --body-file body.md || echo "no log issue yet"
