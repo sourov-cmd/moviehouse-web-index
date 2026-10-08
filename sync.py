@@ -177,15 +177,15 @@ class Layout:
         for tab_id, shelves in self.their.items():
             if state is not None:
                 for sid, row in cur_shelves.items():
-                    if row[1] == tab_id and row[4] == "their" and sid not in shelves:
+                    if row[1] == tab_id and row[4] == "their" and sid not in shelves and not sid.startswith("src-"):  # src-*: a second source's shelf (rtally_sync.py)
                         out.add("DELETE FROM shelf_items WHERE shelf_id=?", sid)
                         out.add("DELETE FROM shelf_groups WHERE shelf_id=?", sid)
                         out.add("DELETE FROM shelves WHERE id=?", sid)
                         n["deleted"] += 1
             else:
-                out.add("DELETE FROM shelf_items WHERE shelf_id IN (SELECT id FROM shelves WHERE tab_id=? AND kind='their')", tab_id)
-                out.add("DELETE FROM shelf_groups WHERE shelf_id IN (SELECT id FROM shelves WHERE tab_id=? AND kind='their')", tab_id)
-                out.add("DELETE FROM shelves WHERE tab_id=? AND kind='their'", tab_id)
+                out.add("DELETE FROM shelf_items WHERE shelf_id IN (SELECT id FROM shelves WHERE tab_id=? AND kind='their' AND id NOT LIKE 'src-%')", tab_id)
+                out.add("DELETE FROM shelf_groups WHERE shelf_id IN (SELECT id FROM shelves WHERE tab_id=? AND kind='their' AND id NOT LIKE 'src-%')", tab_id)
+                out.add("DELETE FROM shelves WHERE tab_id=? AND kind='their' AND id NOT LIKE 'src-%'", tab_id)
             for row in shelves.values():
                 shelf_write(row)
         for row in self.rails.values():
@@ -716,15 +716,37 @@ def apply_sqlite(db: sqlite3.Connection, out: Out):
     out.applied = len(out.stmts)
 
 
+def ingest_token(fallback: str) -> str:
+    """The bearer for /ingest. On GitHub Actions a fresh OIDC token is minted for every call: the job's tokens live
+    five minutes (exp - iat = 300 s), and a run that spends its budget on MovieBox takes longer than that — run 10 on
+    2026-10-08 read its plan fine, walked for five minutes, then pushed with the expired token and got 403."""
+    url, req = os.environ.get("ACTIONS_ID_TOKEN_REQUEST_URL"), os.environ.get("ACTIONS_ID_TOKEN_REQUEST_TOKEN")
+    if url and req:
+        try:
+            r = httpx.get(url, params={"audience": "moviehouse-web-ingest"}, headers={"Authorization": f"bearer {req}"}, timeout=30)
+            r.raise_for_status()
+            tok = r.json().get("value") or ""
+            if tok:
+                return tok
+        except Exception as e:  # fall back to the token minted by the workflow step
+            print(f"oidc: mint failed ({str(e)[:120]}), using the step's token", file=sys.stderr)
+    return fallback
+
+
 def push_worker(url: str, token: str, out: Out, chunk=400):
-    """POST {stmts:[{sql,params}]} chunks to the Worker's /ingest, which runs D1 batch()."""
+    """POST {stmts:[{sql,params}]} chunks to the Worker's /ingest, which runs D1 batch(). Already-pushed statements
+    (out.applied) are skipped, so the sync can push after each phase and a failure late in the run loses little."""
+    todo = out.stmts[out.applied:]
+    if not todo:
+        return
     with httpx.Client(timeout=120) as c:
-        for i in range(0, len(out.stmts), chunk):
-            body = {"stmts": [{"sql": s, "params": list(p)} for s, p in out.stmts[i:i + chunk]]}
-            r = c.post(url, json=body, headers={"authorization": f"Bearer {token}"})
+        for i in range(0, len(todo), chunk):
+            body = {"stmts": [{"sql": s, "params": list(p)} for s, p in todo[i:i + chunk]]}
+            r = c.post(url, json=body, headers={"authorization": f"Bearer {ingest_token(token)}"})
             if r.status_code != 200:
                 raise SystemExit(f"ingest {r.status_code}: {r.text[:300]}")
-    print(f"pushed {len(out.stmts)} statements")
+            out.applied += len(body["stmts"])
+    print(f"pushed {len(todo)} statements", flush=True)
 
 
 def main():
@@ -775,7 +797,7 @@ def main():
     if args.push and db is None:
         # the Worker knows what the index lacks; this runner has no copy of the database
         try:
-            plan = fetch_json(args.push + f"?plan=1&details={args.details}&seasons={args.seasons}&rankings={args.rankings}&layout={'all' if wide else 'their'}", {"Authorization": f"Bearer {args.token}"})
+            plan = fetch_json(args.push + f"?plan=1&details={args.details}&seasons={args.seasons}&rankings={args.rankings}&layout={'all' if wide else 'their'}", {"Authorization": f"Bearer {ingest_token(args.token)}"})
             st = plan.get("state") or {}
             print(f"plan: wanted={len(plan.get('wanted', []))} details={len(plan.get('details', []))} seasons={len(plan.get('seasons', []))} rankings={len(plan.get('rankings', []))} "
                   f"layout: shelves={len(st.get('shelves', []))} items={len(st.get('items', []))}")
@@ -796,14 +818,18 @@ def main():
     # the layout (tabs, banners, shelves, items) goes out as a diff against what the index holds
     state = plan.get("state") if plan else (layout_state_from_db(db, wide) if db is not None else None)
     print(f"layout diff: {s.layout.emit(out, state, now())}" + ("" if state is not None else " (no state: full rewrite)"))
-    # subjects seen above must exist before detail/season queries read the db
+    # subjects seen above must exist before detail/season queries read the db; a push after each phase keeps a late failure small
     if db is not None:
         apply_sqlite(db, out)
+    if args.push and db is None:
+        push_worker(args.push, args.token, out)
     if not only or "rankings" in only:
         s.sync_rankings(args.rankings)
     s.flush_subjects()
     if db is not None:
         apply_sqlite(db, out)
+    if args.push and db is None:
+        push_worker(args.push, args.token, out)
     if not only or "details" in only:
         s.sync_details(args.details)
     if not only or "seasons" in only:
